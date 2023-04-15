@@ -1,0 +1,19 @@
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = [
+  "E",  # pycodestyle errors
+  "F",  # pyflakes
+  "I",  # isort
+]
+ignore = [
+  "E501",  # handled by black line-length
+]
+
+[tool.ruff.isort]
+known-first-party = ["cleaner", "notifications", "clients"]
+

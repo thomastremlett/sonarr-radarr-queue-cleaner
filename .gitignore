@@ -1,0 +1,14 @@
+# Local runtime and secrets
+.env
+config.yaml
+docker-compose.yaml
+
+# Persistent strike data
+data/
+
+# Python & tooling
+__pycache__/
+.pytest_cache/
+.venv/
+*.pyc
+
