@@ -16,6 +16,8 @@ docker build -t media-cleaner .
 ```
 
 ### Run Docker Container
+*Make sure to change the sonarr/radarr api_key and url to suit your needs*
+
 ```bash
 docker run -d --name media-cleaner \
 -e SONARR_API_KEY='your_sonarr_api_key' \
