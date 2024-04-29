@@ -2,19 +2,26 @@ version: '3.8'
 
 services:
   media-cleaner:
-    # image: media-cleaner:latest
     build:
-      context: ./repository_path
+      context: ./
       dockerfile: Dockerfile
     container_name: media-cleaner
     environment:
-      SONARR_API_KEY: "your_sonarr_api_key"
-      RADARR_API_KEY: "your_radarr_api_key"
-      SONARR_URL: "http://sonarr:8989"
-      RADARR_URL: "http://radarr:7878"
-      API_TIMEOUT: "3600"  # Set to check every hour
-      STALL_COUNT_LIMIT: "3" # Number of checks before grabbing different release
-      RESET_STRIKES_ON_PROGRESS: "all" # Number of strikes to remove from stall count when release is not stalled
+      # SONARR_URL: "http://sonarr:8989"
+      # SONARR_API_KEY: "your_sonarr_api_key"
+      # SONARR_STALL_LIMIT: "5"
+      # SONARR_AUTO_SEARCH: "false"  
+      # RADARR_URL: "http://radarr:7878"
+      # RADARR_API_KEY: "your_radarr_api_key"
+      # RADARR_STALL_LIMIT: "5"
+      # RADARR_AUTO_SEARCH: "false"  
+      LIDARR_URL: "http://172.24.1.241:8686/api/v1"
+      LIDARR_API_KEY: "16682e99988d4f82b6b2d0fd23b2df1c"
+      # LIDARR_STALL_LIMIT: "5"
+      LIDARR_AUTO_SEARCH: "true"  
+      API_TIMEOUT: "30"
+      GLOBAL_STALL_LIMIT: "3"
+      DEBUG_LOGGING: "true"
     volumes:
       - "./data:/app/data"  # Ensure this path aligns with the STRIKE_FILE_PATH in your script
     restart: unless-stopped
