@@ -16,7 +16,7 @@ services:
       # RADARR_STALL_LIMIT: "5"
       # RADARR_AUTO_SEARCH: "false"  
       LIDARR_URL: "http://172.24.1.241:8686/api/v1"
-      LIDARR_API_KEY: "16682e99988d4f82b6b2d0fd23b2df1c"
+      LIDARR_API_KEY: ""
       # LIDARR_STALL_LIMIT: "5"
       LIDARR_AUTO_SEARCH: "true"  
       API_TIMEOUT: "30"
