@@ -91,6 +91,11 @@ class ConfigAccessor:
             'api_key': _get_env(f'{upper}_API_KEY') or None,
         }
 
+    # General settings accessor
+    def general(self, key: str, default: Any = None) -> Any:
+        gen = self.cfg.get('general') if isinstance(self.cfg.get('general'), dict) else {}
+        return gen.get(key, default)
+
 
 def sanitize_config(cfg: Dict[str, Any], debug_logging: bool = False) -> Dict[str, Any]:
     if not isinstance(cfg, dict):

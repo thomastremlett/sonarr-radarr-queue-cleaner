@@ -104,6 +104,25 @@ from core.actions import ActionsDeps as _ActionsDeps
 from core import actions as _actions
 from core.config import ConfigAccessor as _ConfigAccessor
 
+_AC = _ConfigAccessor(CONFIG)
+
+# Prefer YAML general for app-level settings; fallback to env-loaded defaults
+def _get_general(key: str, default: Any) -> Any:
+    val = _AC.general(key, None)
+    return default if val is None else val
+
+# Override previously read env defaults with YAML when provided
+DEBUG_LOGGING = bool(_get_general('debug_logging', DEBUG_LOGGING))
+STRUCTURED_LOGS = bool(_get_general('structured_logs', STRUCTURED_LOGS))
+DRY_RUN = bool(_get_general('dry_run', DRY_RUN))
+EXPLAIN_DECISIONS = bool(_get_general('explain_decisions', EXPLAIN_DECISIONS))
+API_TIMEOUT = int(_get_general('api_timeout', API_TIMEOUT))
+STRIKE_FILE_PATH = str(_get_general('strike_file_path', STRIKE_FILE_PATH))
+REQUEST_TIMEOUT = int(_get_general('request_timeout', REQUEST_TIMEOUT))
+RETRY_ATTEMPTS = int(_get_general('retry_attempts', RETRY_ATTEMPTS))
+RETRY_BACKOFF = float(_get_general('retry_backoff', RETRY_BACKOFF))
+RESET_STRIKES_ON_PROGRESS = _get_general('reset_strikes_on_progress', RESET_STRIKES_ON_PROGRESS)
+
 from integrations.clients import (
     get_client_speed as __clients_get_client_speed,
     enrich_with_client_state as __clients_enrich_with_client_state,
@@ -112,17 +131,15 @@ from integrations.clients import (
 
  # notify_* provided via notifications module import above
 
-_AC = _ConfigAccessor(CONFIG)
-
 # Environment variables for service endpoints and per-service defaults
 def _svc_entry(name: str) -> Dict[str, Any]:
     ep = _AC.service_endpoint(name)
-    upper = name.upper()
     return {
         'api_url': ep.get('api_url') or '',
+        # API key is sourced from environment only (e.g., SONARR_API_KEY)
         'api_key': ep.get('api_key') or '',
-        'stall_limit': get_env_var(f'{upper}_STALL_LIMIT', default=GLOBAL_STALL_LIMIT, cast_to=int),
-        'auto_search': get_env_var(f'{upper}_AUTO_SEARCH', default='false', cast_to=lambda x: x.lower() in ['true', '1', 'yes']),
+        'stall_limit': int(_AC.get_service_setting(name, 'stall_limit', GLOBAL_STALL_LIMIT)),
+        'auto_search': bool(_AC.get_service_setting(name, 'auto_search', False)),
     }
 
 services = {
@@ -166,8 +183,8 @@ def _log_event(event: str, **fields):
 # - TORRENT_SEEDER_STALL_THRESHOLD <= N seeders will be considered stalled (only for torrent items)
 # - TORRENT_SEEDER_STALL_PROGRESS_CEILING only applies the above when progress percent is <= this ceiling
 #   Set to 100 to apply regardless of progress; set threshold < 0 to disable feature entirely.
-TORRENT_SEEDER_STALL_THRESHOLD = get_env_var('TORRENT_SEEDER_STALL_THRESHOLD', default=-1, cast_to=int)
-TORRENT_SEEDER_STALL_PROGRESS_CEILING = get_env_var('TORRENT_SEEDER_STALL_PROGRESS_CEILING', default=25.0, cast_to=float)
+TORRENT_SEEDER_STALL_THRESHOLD = int(_get_general('torrent_seeder_stall_threshold', get_env_var('TORRENT_SEEDER_STALL_THRESHOLD', default=-1, cast_to=int)))
+TORRENT_SEEDER_STALL_PROGRESS_CEILING = float(_get_general('torrent_seeder_stall_progress_ceiling', get_env_var('TORRENT_SEEDER_STALL_PROGRESS_CEILING', default=25.0, cast_to=float)))
 
 strike_dict = storage_load_strikes(STRIKE_FILE_PATH, DEBUG_LOGGING)
 strike_lock = asyncio.Lock()

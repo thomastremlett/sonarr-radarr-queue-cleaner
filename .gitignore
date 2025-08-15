@@ -1,7 +1,6 @@
 # Local runtime and secrets
 .env
 config.yaml
-docker-compose.yaml
 
 # Persistent strike data
 data/
@@ -12,3 +11,4 @@ __pycache__/
 .venv/
 *.pyc
 
+.coverage

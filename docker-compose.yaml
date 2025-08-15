@@ -1,0 +1,14 @@
+services:
+  media-cleaner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: media-cleaner
+    env_file:
+      - .env  # put your URLs/keys and options here
+    environment:
+      TZ: ${TZ:-Australia/Brisbane}
+    volumes:
+      - "./data:/app/data"                  # Strike DB path
+      - "./config.yaml:/app/config.yaml:ro" # YAML configuration (optional)
+    restart: unless-stopped
