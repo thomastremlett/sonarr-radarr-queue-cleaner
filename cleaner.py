@@ -47,11 +47,16 @@ except TypeError:
 # Dedicated non-propagating logger for structured event logs to avoid duplicates
 EVENT_LOG = logging.getLogger('media_cleaner.events')
 EVENT_LOG.setLevel(logging_level)
-EVENT_LOG.propagate = True
-if not EVENT_LOG.handlers:
-    _h = logging.StreamHandler()
-    _h.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s'))
-    EVENT_LOG.addHandler(_h)
+# Prevent propagation to root to avoid duplicate lines when both
+# this logger and the root logger have StreamHandlers attached.
+EVENT_LOG.propagate = False
+# Always ensure exactly one handler on the event logger to avoid duplicates
+# in cases where the module is re-imported by a runner.
+for _h in list(EVENT_LOG.handlers):
+    EVENT_LOG.removeHandler(_h)
+_h = logging.StreamHandler()
+_h.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s]: %(message)s'))
+EVENT_LOG.addHandler(_h)
 
 GLOBAL_STALL_LIMIT = get_env_var('GLOBAL_STALL_LIMIT', default=3, cast_to=int)
 
@@ -267,11 +272,25 @@ def process_queue_item(service_name, item, stall_limit, metrics):
     try:
         # Supports both dict and Metrics class
         metrics['processed'] = metrics.get('processed', 0) + 1
+        metrics[f'svc:{service_name}:processed'] = metrics.get(f'svc:{service_name}:processed', 0) + 1
     except Exception:
         pass
     key = _make_strike_key(service_name, item['id'])
     entry = _normalize_strike_entry(strike_dict.get(key, {"count": 0, "last_dl": None}))
     now = time.time()
+
+    # Detect completed downloads early so we can preserve them
+    # even if indexer/tracker failures occur afterwards.
+    try:
+        _sz_left = item.get('sizeleft') if item.get('sizeleft') is not None else item.get('sizeLeft')
+        _sz_left_zero = (int(_sz_left) == 0) if _sz_left is not None else False
+    except Exception:
+        _sz_left_zero = False
+    try:
+        _pct_prog = _get_progress_percent(item)
+        fully_downloaded = bool(_sz_left_zero or (_pct_prog is not None and _pct_prog >= 99.9))
+    except Exception:
+        fully_downloaded = bool(_sz_left_zero)
 
     # Per-indexer failure policy
     idx = _get_indexer_name(item)
@@ -285,8 +304,20 @@ def process_queue_item(service_name, item, stall_limit, metrics):
         ikey = f"{service_name}:_indexer:{idx}"
         ientry = strike_dict.get(ikey) or {}
         if int(ientry.get('failures') or 0) >= idx_fail_after:
+            if fully_downloaded:
+                # Preserve completed downloads from indexer failure policy removals
+                entry['last_reason'] = 'completed_preserved_indexer_failure'
+                strike_dict[key] = entry
+                if EXPLAIN_DECISIONS:
+                    _log_event('preserve_completed_indexer_failure', service=service_name, id=item.get('id'), title=item.get('title'))
+                return (False, False)
             removal_reasons[key] = 'indexer_failure_policy'
             strike_dict.pop(key, None)
+            try:
+                metrics['removed_indexer_failure'] = metrics.get('removed_indexer_failure', 0) + 1
+                metrics[f'svc:{service_name}:removed_indexer_failure'] = metrics.get(f'svc:{service_name}:removed_indexer_failure', 0) + 1
+            except Exception:
+                pass
             return (True, services[service_name]['auto_search'])
     # Whitelist check
     if _is_whitelisted(service_name, item):
@@ -298,6 +329,31 @@ def process_queue_item(service_name, item, stall_limit, metrics):
 
     downloaded = _get_downloaded_bytes(item)
     status = (item.get('status') or '').lower()
+
+    # Guard: preserve fully-downloaded items that have post-download errors (e.g., manual import required)
+    # `fully_downloaded` computed earlier in the function.
+    # Collate any status/error text to detect import-related issues
+    texts = []
+    for msg in (item.get('statusMessages') or []):
+        texts.append(f"{msg.get('title','')} {msg.get('messages','')} {msg.get('message','')}")
+    if item.get('errorMessage'):
+        texts.append(str(item.get('errorMessage')))
+    combined_txt = ' '.join(texts).lower()
+    tds = (item.get('trackedDownloadStatus') or item.get('trackedDownloadState') or '').lower()
+    # Heuristics: import-related signals or generic warning/error state after full download
+    import_keywords = ('import failed', 'failed to import', 'manual import', 'manually import', 'manual intervention', 'waiting to import', 'waiting for import')
+    import_related = any(k in combined_txt for k in import_keywords) or ('import' in combined_txt and any(s in combined_txt for s in ('fail', 'manual', 'intervention', 'waiting')))
+    post_download_error = (tds in ('warning', 'error')) or (status in ('warning', 'error')) or import_related
+    if fully_downloaded and post_download_error:
+        # Do not count strikes or remove automatically; allow manual handling
+        entry['last_reason'] = 'downloaded_but_errored'
+        entry['last_dl'] = downloaded if downloaded is not None else entry.get('last_dl')
+        entry['last_progress_ts'] = entry.get('last_progress_ts')  # keep as-is
+        entry['last_seen_seeders'] = _get_seeders(item)
+        strike_dict[key] = entry
+        if EXPLAIN_DECISIONS:
+            _log_event('skip_downloaded_errored', service=service_name, id=item.get('id'), title=item.get('title'))
+        return (False, False)
 
     # Pre-progress checks: hard caps, tracker error accumulation, and reannounce scheduling
     # 1) Max queue age hard cap
@@ -331,6 +387,13 @@ def process_queue_item(service_name, item, stall_limit, metrics):
         if any(p in alltxt for p in phrases):
             entry['error_strikes'] = int(entry.get('error_strikes') or 0) + 1
             if entry['error_strikes'] >= err_needed:
+                if fully_downloaded:
+                    # Preserve completed downloads despite tracker/indexer error strikes
+                    entry['last_reason'] = 'completed_preserved_tracker_error'
+                    strike_dict[key] = entry
+                    if EXPLAIN_DECISIONS:
+                        _log_event('preserve_completed_tracker_error', service=service_name, id=item.get('id'), title=item.get('title'))
+                    return (False, False)
                 removal_reasons[key] = 'tracker_error'
                 # track indexer failures
                 idx = _get_indexer_name(item)
@@ -363,10 +426,16 @@ def process_queue_item(service_name, item, stall_limit, metrics):
             cooldown = float(rea.get('cooldown_minutes', 60))
             max_attempts = int(rea.get('max_attempts', 1))
             if attempts < max_attempts and (not last or (now - float(last)) >= (cooldown * 60)):
+                already = reannounce_requests.get(key, False)
                 reannounce_requests[key] = True
                 entry['last_reason'] = 'reannounce_scheduled'
                 strike_dict[key] = entry
-                if EXPLAIN_DECISIONS:
+                try:
+                    if not already:
+                        metrics['reannounce_scheduled'] = metrics.get('reannounce_scheduled', 0) + 1
+                except Exception:
+                    pass
+                if EXPLAIN_DECISIONS and not already:
                     _log_event('reannounce_scheduled', service=service_name, id=item.get('id'), title=item.get('title'))
                 return (False, False)
 
@@ -398,14 +467,27 @@ def process_queue_item(service_name, item, stall_limit, metrics):
         effective_limit = stall_limit
 
     if progressed:
+        _before_cnt = int(entry.get('count') or 0)
         if str(RESET_STRIKES_ON_PROGRESS).lower() == 'all':
             entry['count'] = 0
+            try:
+                if _before_cnt > 0:
+                    metrics['strike_decreased'] = metrics.get('strike_decreased', 0) + 1
+                    metrics[f'svc:{service_name}:strike_decreased'] = metrics.get(f'svc:{service_name}:strike_decreased', 0) + 1
+            except Exception:
+                pass
         else:
             try:
                 dec = max(1, int(RESET_STRIKES_ON_PROGRESS))
             except Exception:
                 dec = 1
-            entry['count'] = max(0, entry['count'] - dec)
+            entry['count'] = max(0, _before_cnt - dec)
+            try:
+                if entry['count'] < _before_cnt:
+                    metrics['strike_decreased'] = metrics.get('strike_decreased', 0) + 1
+                    metrics[f'svc:{service_name}:strike_decreased'] = metrics.get(f'svc:{service_name}:strike_decreased', 0) + 1
+            except Exception:
+                pass
         entry['last_dl'] = downloaded if downloaded is not None else entry['last_dl']
         entry['last_progress_ts'] = now
         entry['last_seen_seeders'] = _get_seeders(item)
@@ -420,6 +502,11 @@ def process_queue_item(service_name, item, stall_limit, metrics):
         entry['last_reason'] = 'queued'
         entry['last_seen_seeders'] = _get_seeders(item)
         strike_dict[key] = entry
+        try:
+            metrics['queued'] = metrics.get('queued', 0) + 1
+            metrics[f'svc:{service_name}:queued'] = metrics.get(f'svc:{service_name}:queued', 0) + 1
+        except Exception:
+            pass
         if EXPLAIN_DECISIONS:
             _log_event('queued', service=service_name, id=item.get('id'), title=item.get('title'))
         return (False, False)
@@ -465,10 +552,16 @@ def process_queue_item(service_name, item, stall_limit, metrics):
                 return False
             return True
         if _should_try_reannounce_local():
+            already = reannounce_requests.get(key, False)
             reannounce_requests[key] = True
             entry['last_reason'] = 'reannounce_scheduled'
             strike_dict[key] = entry
-            if EXPLAIN_DECISIONS:
+            try:
+                if not already:
+                    metrics['reannounce_scheduled'] = metrics.get('reannounce_scheduled', 0) + 1
+            except Exception:
+                pass
+            if EXPLAIN_DECISIONS and not already:
                 _log_event('reannounce_scheduled', service=service_name, id=item.get('id'), title=item.get('title'))
             return (False, False)
         entry['last_dl'] = downloaded if downloaded is not None else entry.get('last_dl')
@@ -481,7 +574,14 @@ def process_queue_item(service_name, item, stall_limit, metrics):
             if EXPLAIN_DECISIONS:
                 _log_event('remove', service=service_name, id=item.get('id'), title=item.get('title'), reason=reason)
             return (True, services[service_name]['auto_search'])
-        entry['count'] = entry.get('count', 0) + 1
+        _before_cnt2 = int(entry.get('count') or 0)
+        entry['count'] = _before_cnt2 + 1
+        try:
+            if entry['count'] > _before_cnt2:
+                metrics['strike_increased'] = metrics.get('strike_increased', 0) + 1
+                metrics[f'svc:{service_name}:strike_increased'] = metrics.get(f'svc:{service_name}:strike_increased', 0) + 1
+        except Exception:
+            pass
         strike_dict[key] = entry
         if entry['count'] >= effective_limit:
             removal_reasons[key] = reason
@@ -502,8 +602,8 @@ def process_queue_item(service_name, item, stall_limit, metrics):
                     extra.append(f'progress={pct:.1f}%')
                 ctx = f" ({', '.join(extra)})" if extra else ''
                 logging.info(f'Service {service_name}: strike {entry["count"]} id={item.get("id")} title={item.get("title")} reason={reason}{ctx}')
-            if EXPLAIN_DECISIONS:
-                _log_event('strike', service=service_name, id=item.get('id'), title=item.get('title'), reason=reason, strikes=entry['count'])
+        if EXPLAIN_DECISIONS:
+            _log_event('strike', service=service_name, id=item.get('id'), title=item.get('title'), reason=reason, strikes=entry['count'])
     else:
         if downloaded is not None:
             entry['last_dl'] = downloaded
@@ -557,6 +657,8 @@ async def manage_downloads(session, service_config, service_name, metrics):
         strike_lock=strike_lock,
         reannounce_requests=reannounce_requests,
         removal_reasons=removal_reasons,
+        reannounce_seen=set(),
+        processed_seen=set(),
     )
     await runner_manage_service(session, service_config, service_name, metrics, deps)
 
@@ -588,6 +690,8 @@ async def main():
             strike_lock=strike_lock,
             reannounce_requests=reannounce_requests,
             removal_reasons=removal_reasons,
+            reannounce_seen=set(),
+            processed_seen=set(),
         )
         await runner_run_forever(session, services, state, _manage_cb, _flush_cb, _log_fn)
 

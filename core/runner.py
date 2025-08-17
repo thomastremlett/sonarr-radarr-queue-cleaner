@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 
@@ -13,6 +13,10 @@ class RunnerState:
     strike_lock: Any
     reannounce_requests: Dict[str, bool]
     removal_reasons: Dict[str, str]
+    # Deduplication set for reannounce attempts within a single run loop
+    reannounce_seen: set = field(default_factory=set)
+    # Deduplicate processing of the same queue item id within a single run
+    processed_seen: set = field(default_factory=set)
 
 
 @dataclass
@@ -79,7 +83,13 @@ async def manage_service(
         if deps.debug_logging:
             import logging
             logging.info(f'Service {service_name}: queue size {total_records}')
-        page_size = min(total_records, 100)
+        # Handle empty queues safely to avoid division by zero
+        if not total_records:
+            if deps.debug_logging:
+                import logging
+                logging.info(f'Service {service_name}: queue empty; nothing to process')
+            return
+        page_size = min(total_records, 100) or 1
         pages = (total_records + page_size - 1) // page_size
         if deps.debug_logging:
             import logging
@@ -102,6 +112,15 @@ async def manage_service(
                         f'Service {service_name}: processing {len(queue_data["records"])} items from page {page + 1}/{pages}'
                     )
                 for item in queue_data['records']:
+                    # Skip duplicate queue records for the same item id within this run
+                    try:
+                        unique_key = deps.make_strike_key(service_name, item['id'])
+                    except Exception:
+                        unique_key = None
+                    if unique_key is not None:
+                        if unique_key in deps.state.processed_seen:
+                            continue
+                        deps.state.processed_seen.add(unique_key)
                     try:
                         # Optional client speed enrichment for min_speed rule
                         try:
@@ -130,10 +149,25 @@ async def manage_service(
                             if entry_tmp.get('last_reason') == 'reannounce_scheduled':
                                 scheduled = True
                         if scheduled:
+                            # Deduplicate reannounce attempts per download/torrent within this run
+                            dlid = item.get('downloadId') or item.get('downloadID')
+                            dedupe_key = f"{service_name}:{dlid}" if dlid else deps.make_strike_key(service_name, item['id'])
+                            if dedupe_key in deps.state.reannounce_seen:
+                                continue
                             entry2 = deps.normalize_strike_entry(deps.state.strike_dict.get(key2, {}))
                             try:
                                 ok = await deps.attempt_reannounce(session, item, entry2)
                                 deps.state.strike_dict[key2] = entry2
+                                deps.state.reannounce_seen.add(dedupe_key)
+                                # metrics updates
+                                try:
+                                    metrics['reannounce_attempted'] = metrics.get('reannounce_attempted', 0) + 1
+                                    metrics[f'svc:{service_name}:reannounce_attempted'] = metrics.get(f'svc:{service_name}:reannounce_attempted', 0) + 1
+                                    if ok:
+                                        metrics['reannounce_successful'] = metrics.get('reannounce_successful', 0) + 1
+                                        metrics[f'svc:{service_name}:reannounce_successful'] = metrics.get(f'svc:{service_name}:reannounce_successful', 0) + 1
+                                except Exception:
+                                    pass
                                 if deps.explain_decisions:
                                     deps.log_event(
                                         f'reannounce service={service_name} id={item.get("id")} title={item.get("title")} ok={ok}'
@@ -152,6 +186,13 @@ async def manage_service(
                                 else:
                                     await deps.remove_and_blacklist(session, service_name, item, reason)
                             metrics['removed'] = metrics.get('removed', 0) + 1
+                            try:
+                                metrics[f'svc:{service_name}:removed'] = metrics.get(f'svc:{service_name}:removed', 0) + 1
+                                if reason == 'indexer_failure_policy':
+                                    metrics['removed_indexer_failure'] = metrics.get('removed_indexer_failure', 0) + 1
+                                    metrics[f'svc:{service_name}:removed_indexer_failure'] = metrics.get(f'svc:{service_name}:removed_indexer_failure', 0) + 1
+                            except Exception:
+                                pass
                     except Exception as e:
                         import logging
                         logging.error(f'Service {service_name}: item processing error: {e}')
@@ -170,6 +211,13 @@ class Metrics:
     def __init__(self) -> None:
         self.processed = 0
         self.removed = 0
+        self.strike_increased = 0
+        self.strike_decreased = 0
+        self.reannounce_scheduled = 0
+        self.reannounce_attempted = 0
+        self.reannounce_successful = 0
+        # generic counters and per-service aggregation
+        self.extra: Dict[str, int] = {}
 
     # dict-like methods for backward compatibility
     def get(self, key: str, default: int = 0) -> int:
@@ -177,7 +225,17 @@ class Metrics:
             return self.processed
         if key == 'removed':
             return self.removed
-        return default
+        if key == 'strike_increased':
+            return self.strike_increased
+        if key == 'strike_decreased':
+            return self.strike_decreased
+        if key == 'reannounce_scheduled':
+            return self.reannounce_scheduled
+        if key == 'reannounce_attempted':
+            return self.reannounce_attempted
+        if key == 'reannounce_successful':
+            return self.reannounce_successful
+        return self.extra.get(key, default)
 
     def __getitem__(self, key: str) -> int:
         return self.get(key, 0)
@@ -187,6 +245,18 @@ class Metrics:
             self.processed = value
         elif key == 'removed':
             self.removed = value
+        elif key == 'strike_increased':
+            self.strike_increased = value
+        elif key == 'strike_decreased':
+            self.strike_decreased = value
+        elif key == 'reannounce_scheduled':
+            self.reannounce_scheduled = value
+        elif key == 'reannounce_attempted':
+            self.reannounce_attempted = value
+        elif key == 'reannounce_successful':
+            self.reannounce_successful = value
+        else:
+            self.extra[key] = value
 
 
 def summarize(state: RunnerState, metrics: Metrics) -> Dict[str, Any]:
@@ -203,10 +273,63 @@ def summarize(state: RunnerState, metrics: Metrics) -> Dict[str, Any]:
         next_run_str = __import__('time').strftime('%Y-%m-%d %H:%M:%S', __import__('time').localtime(next_run_ts))
     except Exception:
         next_run_str = 'unknown'
+    # Per-service items_with_strikes
+    strikes_by_service: Dict[str, int] = {}
+    try:
+        for k, v in state.strike_dict.items():
+            if not isinstance(v, dict) or ':_indexer:' in str(k):
+                continue
+            try:
+                svc, _ = str(k).split(':', 1)
+            except ValueError:
+                continue
+            if int(v.get('count') or 0) > 0:
+                strikes_by_service[svc] = strikes_by_service.get(svc, 0) + 1
+    except Exception:
+        pass
+
+    # Build per-service summary from metrics.extra keys and strike counts
+    per_service: Dict[str, Dict[str, int]] = {}
+    def _svc_stat(svc: str, key: str, default: int = 0) -> int:
+        return metrics.get(f'svc:{svc}:{key}', default)
+
+    for svc in strikes_by_service.keys():
+        per_service.setdefault(svc, {})
+    # Also include services seen in metrics.extra
+    try:
+        for ek in list(metrics.extra.keys()):
+            if ek.startswith('svc:'):
+                parts = ek.split(':', 2)
+                if len(parts) == 3:
+                    per_service.setdefault(parts[1], {})
+    except Exception:
+        pass
+
+    for svc in list(per_service.keys()):
+        per_service[svc] = {
+            'processed': _svc_stat(svc, 'processed'),
+            'removed': _svc_stat(svc, 'removed'),
+            'queued': _svc_stat(svc, 'queued'),
+            'strike_increased': _svc_stat(svc, 'strike_increased'),
+            'strike_decreased': _svc_stat(svc, 'strike_decreased'),
+            'reannounce_scheduled': _svc_stat(svc, 'reannounce_scheduled'),
+            'reannounce_attempted': _svc_stat(svc, 'reannounce_attempted'),
+            'reannounce_successful': _svc_stat(svc, 'reannounce_successful'),
+            'removed_indexer_failure': _svc_stat(svc, 'removed_indexer_failure'),
+            'items_with_strikes': strikes_by_service.get(svc, 0),
+        }
+
     return {
         'processed': metrics.processed,
         'removed': metrics.removed,
         'items_with_strikes': strikes_active,
+        'strike_increased': metrics.strike_increased,
+        'strike_decreased': metrics.strike_decreased,
+        'reannounce_scheduled': metrics.reannounce_scheduled,
+        'reannounce_attempted': metrics.reannounce_attempted,
+        'reannounce_successful': metrics.reannounce_successful,
+        'removed_indexer_failure': metrics.get('removed_indexer_failure', 0),
+        'per_service': per_service,
         'next_run': next_run_str,
     }
 
@@ -220,6 +343,15 @@ async def run_forever(
     log_fn: Callable[[str], None],
 ) -> None:
     while True:
+        # Reset per-iteration dedupe state
+        try:
+            state.reannounce_seen.clear()
+        except Exception:
+            state.reannounce_seen = set()
+        try:
+            state.processed_seen.clear()
+        except Exception:
+            state.processed_seen = set()
         metrics = Metrics()
         tasks = [manage_cb(session, cfg, name, metrics) for name, cfg in services.items()]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -228,11 +360,26 @@ async def run_forever(
                 log_fn(f"Unhandled error in {svc} task: {res}")
 
         summary = summarize(state, metrics)
-        extras_str = f" items_with_strikes={summary['items_with_strikes']}"
+        log_fn(f"Run summary:")
         log_fn(
-            f"Finished run: processed={summary['processed']} removed={summary['removed']}{extras_str}. "
-            f"Next run at {summary['next_run']} (in {state.api_timeout}s)."
+            f"  processed={summary['processed']} removed={summary['removed']} items_with_strikes={summary['items_with_strikes']}"
         )
+        log_fn(
+            f"  strikes: increased={summary['strike_increased']} decreased={summary['strike_decreased']}"
+        )
+        log_fn(
+            f"  reannounce: scheduled={summary['reannounce_scheduled']} attempted={summary['reannounce_attempted']} successful={summary['reannounce_successful']}"
+        )
+        if summary.get('removed_indexer_failure'):
+            log_fn(f"  indexer_fail_removals={summary['removed_indexer_failure']}")
+        # Per-service lines
+        ps = summary.get('per_service') or {}
+        if ps:
+            for svc, s in ps.items():
+                log_fn(
+                    f"  {svc}: processed={s['processed']} removed={s['removed']} queued={s['queued']} strikes(↑/↓)={s['strike_increased']}/{s['strike_decreased']} reannounce(s/a/ok)={s['reannounce_scheduled']}/{s['reannounce_attempted']}/{s['reannounce_successful']} items_with_strikes={s['items_with_strikes']}"
+                )
+        log_fn(f"Next run: {summary['next_run']} (in {state.api_timeout}s)")
 
         await flush_cb(session)
         await asyncio.sleep(state.api_timeout)
