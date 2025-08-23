@@ -76,6 +76,8 @@ notifications:
 
 services:
   Sonarr:
+    # Trigger a new search after removal/blacklist by this cleaner
+    auto_search: false
     # Number of strikes before an item is removed
     stall_limit: 3
     grace_period_minutes: 0
@@ -87,12 +89,16 @@ services:
     client_state_as_stalled: false          # treat certain client states as stalled
     client_zero_activity_minutes: 0         # consider stalled if peers=0 and seeds=0 for this many minutes
   Radarr:
+    # Trigger a new search after removal/blacklist by this cleaner
+    auto_search: false
     stall_limit: 3
     grace_period_minutes: 0
     no_progress_max_age_minutes: 0
     min_request_interval_ms: 0
     max_concurrent_requests: 0
   Lidarr:
+    # Trigger a new search after removal/blacklist by this cleaner
+    auto_search: false
     stall_limit: 3
     grace_period_minutes: 0
     no_progress_max_age_minutes: 0
@@ -104,6 +110,7 @@ services:
 indexer_policies:
   SomeIndexerName:
     seeder_stall_threshold: 0   # override global seeder threshold for this indexer
+    failure_remove_after: 0     # remove after N tracker/indexer failures for this indexer (0 disables)
 
 # Optional: download client settings for reannounce
 clients:
